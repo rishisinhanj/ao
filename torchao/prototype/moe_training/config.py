@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from torchao.core.config import AOBaseConfig
+from torchao.float8.config import ScalingGranularity
 from torchao.prototype.mx_formats.config import ScaleCalculationMode
 from torchao.quantization.quantize_.common import KernelPreference
 from torchao.quantization.transform_module import register_quantize_module_handler
@@ -22,6 +23,7 @@ class Float8TrainingRecipe(Enum):
     """FP8 recipes for grouped matrix multiplication."""
 
     FP8_ROWWISE = "fp8_rowwise"
+    FP8_TENSORWISE = "fp8_tensorwise"
 
 
 class MXFP8TrainingRecipe(Enum):
@@ -58,6 +60,9 @@ class Float8TrainingOpConfig(TrainingOpBaseConfig):
     # Output dtype for the FP8 grouped GEMMs.
     out_dtype: Optional[torch.dtype] = torch.bfloat16
 
+    # Scaling granularity: AXISWISE (rowwise) or TENSORWISE.
+    scaling_granularity: ScalingGranularity = ScalingGranularity.AXISWISE
+
     # Whether to pad the token group sizes to multiples of 16.
     # On AMD/ROCm this must be False because the CUDA padding kernel is unavailable
     # and the torch fallback (torch_pad_token_groups) does group_sizes.tolist() which
@@ -71,7 +76,9 @@ class Float8TrainingOpConfig(TrainingOpBaseConfig):
     ) -> "Float8TrainingOpConfig":
         """Factory method to create a Float8TrainingOpConfig from a Float8TrainingRecipe."""
         if recipe == Float8TrainingRecipe.FP8_ROWWISE:
-            return cls()
+            return cls(scaling_granularity=ScalingGranularity.AXISWISE)
+        elif recipe == Float8TrainingRecipe.FP8_TENSORWISE:
+            return cls(scaling_granularity=ScalingGranularity.TENSORWISE)
         else:
             raise ValueError(f"Unsupported FP8 recipe: {recipe}")
 
@@ -80,6 +87,7 @@ class Float8TrainingOpConfig(TrainingOpBaseConfig):
             return (
                 self.float8_dtype == other.float8_dtype
                 and self.out_dtype == other.out_dtype
+                and self.scaling_granularity == other.scaling_granularity
                 and self.pad_token_groups_for_grouped_mm
                 == other.pad_token_groups_for_grouped_mm
             )
@@ -90,6 +98,7 @@ class Float8TrainingOpConfig(TrainingOpBaseConfig):
             (
                 self.float8_dtype,
                 self.out_dtype,
+                self.scaling_granularity,
                 self.pad_token_groups_for_grouped_mm,
             )
         )

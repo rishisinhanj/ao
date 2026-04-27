@@ -1,0 +1,511 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD 3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+Tensorwise FP8 grouped GEMM for MoE training.
+
+Unlike the rowwise path (one scale per row/column), the tensorwise path uses:
+- Forward: one scale for all of A, one scale per expert for B_t
+- Backward (grad_A): one scale for grad_output, one scale per expert for B
+- Backward (grad_B): one scale per group for both grad_output and A
+"""
+
+from typing import Optional, Tuple
+
+import torch
+from torch.utils._triton import has_triton
+
+from torchao.float8.float8_utils import amax_to_scale, to_fp8_saturated
+from torchao.prototype.moe_training.kernels.fp8_tensorwise_2d import (
+    triton_fp8_tensorwise_quantize_2d,
+)
+from torchao.prototype.moe_training.kernels.fp8_tensorwise_3d import (
+    triton_fp8_tensorwise_3d_scale_and_cast,
+)
+from torchao.prototype.moe_training.utils import _is_column_major
+
+_USE_TRITON_QUANTIZE_2D = triton_fp8_tensorwise_quantize_2d is not None
+_USE_TRITON_3D = triton_fp8_tensorwise_3d_scale_and_cast is not None
+
+try:
+    from torchao.prototype.moe_training.kernels.jagged_float8_scales import (
+        triton_fp8_per_group_tensorwise_dual_col_major,
+        triton_fp8_per_group_tensorwise_scales,
+        triton_fp8_per_group_tensorwise_scales_col_major,
+    )
+    _USE_JAGGED_PER_GROUP = triton_fp8_per_group_tensorwise_scales is not None
+except ImportError:
+    _USE_JAGGED_PER_GROUP = False
+
+
+@torch.library.custom_op(
+    "torchao::fp8_tensorwise_quantize_2d", mutates_args={}
+)
+def _fp8_tensorwise_quantize_2d(
+    tensor: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Tensorwise quantize a 2D tensor to FP8. Returns (fp8_data, scale_per_row)
+    where scale_per_row is the single tensorwise scale expanded to (M,).
+
+    Registered as custom_op so inductor does not fuse quantization into
+    Triton kernels that may crash during autotuning on certain hardware.
+    """
+    # Fused Triton path: two sequential passes over the tensor (amax then
+    # quantize) instead of ~15 separate ATen kernel launches.  Each ROCm HIP
+    # kernel launch costs ~60 µs in dispatch overhead, so collapsing 15 launches
+    # to 3 saves ~720 µs of pure dispatch overhead per call.
+    #
+    # Falls back to the PyTorch path if Triton is not available or the tensor
+    # is not contiguous (the Triton kernel requires contiguous layout).
+    if _USE_TRITON_QUANTIZE_2D and tensor.is_contiguous():
+        return triton_fp8_tensorwise_quantize_2d(
+            tensor, output_dtype, round_scales_to_power_of_2=True
+        )
+
+    # PyTorch fallback (kept for non-contiguous inputs and non-Triton builds).
+    #
+    # Stay in the original dtype (e.g. BF16) throughout to avoid materialising
+    # a large float32 copy of the input.  The BF16→F32 promotion kernel is the
+    # single largest GPU cost per call (~350 µs for a 98432×2048 tensor) so
+    # keeping large tensors in BF16 cuts that overhead entirely.
+    tensor_clean = torch.nan_to_num(tensor)
+    amax = tensor_clean.abs().amax().to(torch.float32)
+    scale = amax_to_scale(amax, output_dtype, round_scales_to_power_of_2=True)
+    fp8_data = to_fp8_saturated(tensor_clean * scale.to(tensor_clean.dtype), output_dtype)
+    # .contiguous() materialises the expansion so the output has stride (1,).
+    # A stride-0 expanded tensor would cause _scaled_grouped_mm to read
+    # incorrect memory on ROCm, producing a GPU hardware exception.
+    scale_expanded = scale.reshape(1).expand(tensor.size(0)).contiguous()
+    return fp8_data, scale_expanded
+
+
+@_fp8_tensorwise_quantize_2d.register_fake
+def _fake_fp8_tensorwise_quantize_2d(
+    tensor: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, K = tensor.shape
+    fp8_data = torch.empty(M, K, dtype=output_dtype, device=tensor.device)
+    scale_expanded = torch.empty(M, dtype=torch.float32, device=tensor.device)
+    return fp8_data, scale_expanded
+
+
+@torch.library.custom_op(
+    "torchao::fp8_tensorwise_quantize_3d", mutates_args={}
+)
+def _fp8_tensorwise_quantize_3d(
+    tensor: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Per-expert tensorwise quantize a 3D (E, K, N) column-major tensor to FP8.
+    Returns (fp8_data, scales) where scales has shape (E, N) — one scale per
+    expert expanded across the N dimension.
+
+    Registered as custom_op so inductor does not fuse quantization into
+    Triton kernels that may crash during autotuning on certain hardware.
+    """
+    E = tensor.size(0)
+    N = tensor.size(-1)
+
+    # Fused Triton path: 2 kernels + 1 tiny reduce (vs ~14 ATen launches).
+    if _USE_TRITON_3D:
+        fp8_data, scales = triton_fp8_tensorwise_3d_scale_and_cast(
+            tensor, output_dtype, round_scales_to_power_of_2=True,
+        )
+        scale_expanded = scales.unsqueeze(-1).expand(-1, N).contiguous()
+        return fp8_data, scale_expanded
+
+    # PyTorch fallback (kept for non-Triton builds).
+    tensor_clean = torch.nan_to_num(tensor)
+    amax = tensor_clean.abs().amax(dim=(-2, -1)).to(torch.float32)
+    scale = amax_to_scale(amax, output_dtype, round_scales_to_power_of_2=True)
+    fp8_data = to_fp8_saturated(
+        tensor_clean * scale.to(tensor_clean.dtype).view(E, 1, 1), output_dtype
+    )
+    scale_expanded = scale.unsqueeze(-1).expand(-1, N).contiguous()
+    return fp8_data, scale_expanded
+
+
+@_fp8_tensorwise_quantize_3d.register_fake
+def _fake_fp8_tensorwise_quantize_3d(
+    tensor: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    E, K, N = tensor.shape
+    # Preserve column-major strides for the fp8 output.
+    fp8_data = torch.empty(E, K, N, dtype=output_dtype, device=tensor.device)
+    fp8_data = fp8_data.as_strided((E, K, N), (K * N, 1, K))
+    scale_expanded = torch.empty(E, N, dtype=torch.float32, device=tensor.device)
+    return fp8_data, scale_expanded
+
+
+def _to_fp8_tensorwise_then_scaled_grouped_mm(
+    A: torch.Tensor,
+    B_t: torch.Tensor,
+    offs: torch.Tensor,
+    out_dtype: Optional[torch.dtype] = torch.bfloat16,
+    float8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """
+    Differentiable FP8 grouped matrix multiplication with dynamic FP8 tensorwise quantization.
+
+    This function quantizes inputs A and B_t to FP8 format using tensorwise scaling
+    (one scale per tensor for A, one scale per expert for B_t), then performs a
+    scaled grouped matrix multiplication.
+
+    Args:
+        A: Left operand tensor of shape (M, K). Must be row-major,
+            with dtype float32 or bfloat16, and K divisible by 16.
+        B_t: Right operand tensor of shape (E, K, N), transposed and in per-group column-major
+            format, meaning strides of (K*N, 1, K). Must have dtype float32 or bfloat16,
+            with K and N divisible by 16.
+        offs: Offset tensor of shape (num_groups,) with dtype int32, defining
+            group boundaries for the grouped GEMM operation. Group sizes must be divisible by 16.
+        out_dtype: Output dtype for the result. Defaults to torch.bfloat16.
+        float8_dtype: FP8 dtype to quantize to. Defaults to torch.float8_e4m3fn.
+
+    Returns:
+        torch.Tensor: Result of grouped matrix multiplication with shape (M, N).
+    """
+    return _Float8TensorwiseGroupedMM.apply(A, B_t, offs, out_dtype, float8_dtype)
+
+
+class _Float8TensorwiseGroupedMM(torch.autograd.Function):
+    """Differentiable implementation of grouped GEMM with dynamic tensorwise float8 quantization."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        A: torch.Tensor,
+        B_t: torch.Tensor,
+        offs: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16,
+        float8_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> torch.Tensor:
+        assert A.ndim == 2 or A.ndim == 3, "A must be 2D or 3D"
+        assert B_t.ndim == 3, "B must be 3D"
+
+        assert A.size(-1) % 16 == 0, (
+            f"A must have a last dim divisible by 16, but got shape: {A.shape}"
+        )
+        assert B_t.size(-2) % 16 == 0 and B_t.size(-1) % 16 == 0, (
+            f"B must have last 2 dims divisible by 16, but got shape: {B_t.shape}"
+        )
+
+        assert A.dtype == torch.float32 or A.dtype == torch.bfloat16, (
+            "A must be float32 or bfloat16"
+        )
+        assert B_t.dtype == torch.float32 or B_t.dtype == torch.bfloat16, (
+            "B must be float32 or bfloat16"
+        )
+        assert offs is None or offs.dtype == torch.int32, (
+            "offs must be int32 tensor or None"
+        )
+
+        assert A.size(-1) == B_t.size(-2), (
+            f"shape {A.shape} and {B_t.shape} are not compatible for grouped mm"
+        )
+
+        assert not _is_column_major(A), "A must be row-major"
+        assert _is_column_major(B_t), "B must be column-major"
+
+        # Unwrap B_t if it's a wrapper tensor.
+        B_t_data = B_t._data if hasattr(B_t, "_data") else B_t
+
+        # Quantize A and B_t using custom ops (opaque to inductor).
+        A_fp8, A_scales = _fp8_tensorwise_quantize_2d(A, float8_dtype)
+        B_t_fp8, B_t_scales = _fp8_tensorwise_quantize_3d(B_t_data, float8_dtype)
+
+        ctx.save_for_backward(A, B_t_fp8, B_t_scales, offs)
+        ctx.out_dtype = out_dtype
+        ctx.float8_dtype = float8_dtype
+
+        assert not _is_column_major(A_fp8), (
+            "A must be row-major for output = A @ B"
+        )
+        assert _is_column_major(B_t_fp8), (
+            "B must be column-major for output = A @ B"
+        )
+
+        return torch._scaled_grouped_mm(
+            A_fp8,
+            B_t_fp8,
+            A_scales.reciprocal(),
+            B_t_scales.reciprocal(),
+            offs,
+            out_dtype=out_dtype,
+            use_fast_accum=True,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        A, B_t_fp8, B_t_scales, offs = ctx.saved_tensors
+        out_dtype = ctx.out_dtype
+        float8_dtype = ctx.float8_dtype
+
+        # =====================================================================
+        # grad_A = grad_output @ B
+        # =====================================================================
+
+        # Tensorwise quantize grad_output: single scale for entire tensor.
+        grad_output_fp8, grad_output_scales = _fp8_tensorwise_quantize_2d(
+            grad_output, float8_dtype
+        )
+
+        # Reuse B_t_fp8 and B_t_scales cached from forward (avoids re-quantizing
+        # the entire (E, K, N) weight tensor — saves ~13 kernel launches).
+        # B_t_fp8: (E, K, N) col-major, B_t_scales: (E, N)
+        # Transpose (E, K, N) col-major -> (E, N, K) col-major.
+        # .contiguous() on col-major gives row-major (E, K, N),
+        # then .transpose(-2, -1) gives (E, N, K) with strides (K*N, 1, N) = col-major.
+        K = B_t_fp8.size(-2)
+        B_data_col_major = B_t_fp8.contiguous().transpose(-2, -1)
+
+        # Recompute B scales as (E, K) for the transposed B.
+        # B_t_scales is (E, N) — extract per-expert scale (first col) and expand to (E, K).
+        B_scales_expanded = B_t_scales[:, 0:1].expand(-1, K).contiguous()
+
+        assert not _is_column_major(grad_output_fp8), (
+            "grad_output must be row-major for grad_A = grad_output @ B"
+        )
+        assert _is_column_major(B_data_col_major), (
+            "B must be column-major for grad_A = grad_output @ B"
+        )
+
+        grad_A = torch._scaled_grouped_mm(
+            grad_output_fp8,
+            B_data_col_major,
+            grad_output_scales.reciprocal(),
+            B_scales_expanded.reciprocal(),
+            offs,
+            out_dtype=out_dtype,
+            use_fast_accum=True,
+        )
+
+        # =====================================================================
+        # grad_B = grad_output_t @ A
+        # =====================================================================
+        # Both operands are 2D with offsets defining the "jagged" groups.
+        # We use per-group tensorwise scales: one scale per group.
+
+        M, N = grad_output.shape
+        _, K = A.shape
+        num_groups = offs.numel()
+
+        # Fused dual quantize: process both grad_output and A in a single
+        # pair of kernel launches with col-major output, eliminating
+        # separate .copy_() transposes and halving kernel launch count.
+        #
+        # grad_output (M, N) -> col-major FP8, then .t() gives (N, M) row-major
+        # A (M, K) -> col-major FP8 for RHS of grouped GEMM
+        if _USE_JAGGED_PER_GROUP:
+            (grad_out_fp8_col, grad_out_scales,
+             A_col_major, A_scales) = triton_fp8_per_group_tensorwise_dual_col_major(
+                grad_output, A, offs, float8_dtype,
+                round_scales_to_power_of_2=True,
+            )
+            grad_out_scales_flat = (
+                grad_out_scales.unsqueeze(1).expand(-1, N).contiguous().view(-1)
+            )
+            A_scales_flat = (
+                A_scales.unsqueeze(1).expand(-1, K).contiguous().view(-1)
+            )
+        else:
+            grad_out_fp8_col, grad_out_scales_flat = (
+                _fp8_tensorwise_per_group_quantize_col_major(
+                    grad_output, offs, float8_dtype, output_scale_dim=N
+                )
+            )
+            A_col_major, A_scales_flat = (
+                _fp8_tensorwise_per_group_quantize_col_major(
+                    A, offs, float8_dtype, output_scale_dim=K
+                )
+            )
+        grad_output_t_row_major = grad_out_fp8_col.t()
+
+        assert not _is_column_major(grad_output_t_row_major), (
+            "grad_output_t must be row-major for grad_B = grad_output_t @ A"
+        )
+        assert _is_column_major(A_col_major), (
+            "A must be column-major for grad_B = grad_output_t @ A"
+        )
+
+        grad_B = torch._scaled_grouped_mm(
+            grad_output_t_row_major,
+            A_col_major,
+            grad_out_scales_flat.reciprocal(),
+            A_scales_flat.reciprocal(),
+            offs,
+            out_dtype=out_dtype,
+            use_fast_accum=True,
+        )
+        return grad_A, grad_B.transpose(-2, -1), None, None, None
+
+
+@torch.library.custom_op(
+    "torchao::fp8_tensorwise_per_group_quantize", mutates_args={}
+)
+def _fp8_tensorwise_per_group_quantize(
+    tensor: torch.Tensor,
+    offs: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_scale_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a 2D tensor to FP8 with per-group tensorwise scales.
+
+    Each group (defined by offs along dim0) gets a single tensorwise scale,
+    which is then expanded to fill output_scale_dim slots per group in the
+    flat scale tensor.
+
+    Uses PyTorch ops (amax/amin + segment_reduce) for the per-group amax,
+    then expands the per-group scales to the flat format expected by
+    _scaled_grouped_mm.
+
+    Args:
+        tensor: (M, D) 2D input tensor.
+        offs: Group boundary offsets along dim0.
+        output_dtype: Target FP8 dtype.
+        output_scale_dim: Number of scale slots per group in the output
+            (N for colwise / grad_output, K for A).
+
+    Returns:
+        fp8_data: (M, D) FP8 tensor in row-major layout.
+        scales_flat: (output_scale_dim * num_groups,) float32 scale tensor.
+    """
+    assert tensor.ndim == 2, "input tensor must be 2D"
+    M, D = tensor.shape
+    num_groups = offs.numel()
+
+    # 2D tiled Triton path: uses (col_blocks, groups) grid from
+    # jagged_float8_scales.py — no atomic_max, no offset scanning,
+    # proper 2D tiling for cache efficiency.
+    if _USE_JAGGED_PER_GROUP and tensor.is_contiguous():
+        fp8_data, scales = triton_fp8_per_group_tensorwise_scales(
+            tensor, offs, output_dtype, round_scales_to_power_of_2=True,
+        )
+        scales_flat = (
+            scales
+            .unsqueeze(1)
+            .expand(-1, output_scale_dim)
+            .contiguous()
+            .view(-1)
+        )
+        return fp8_data, scales_flat
+
+    # PyTorch fallback (kept for non-contiguous inputs and non-Triton builds).
+    tensor_clean = torch.nan_to_num(tensor)
+
+    row_amax = tensor_clean.abs().amax(dim=1).to(torch.float32)  # (M,) float32
+    group_starts = torch.cat([
+        torch.zeros(1, dtype=offs.dtype, device=offs.device), offs[:-1]
+    ])
+    group_lengths = (offs - group_starts).to(torch.int64)
+    group_amax = torch.segment_reduce(row_amax, "max", lengths=group_lengths, unsafe=True)
+
+    row_group_ids = torch.bucketize(
+        torch.arange(M, device=tensor.device), offs, right=True
+    ).clamp(max=num_groups - 1)
+
+    group_scale = amax_to_scale(
+        group_amax, output_dtype, round_scales_to_power_of_2=True
+    )
+
+    per_row_scale = group_scale[row_group_ids].to(tensor_clean.dtype).unsqueeze(1)  # (M, 1)
+    fp8_data = to_fp8_saturated(tensor_clean * per_row_scale, output_dtype)
+
+    scales_flat = (
+        group_scale
+        .unsqueeze(1)
+        .expand(-1, output_scale_dim)
+        .contiguous()
+        .view(-1)
+    )
+
+    return fp8_data, scales_flat
+
+
+@_fp8_tensorwise_per_group_quantize.register_fake
+def _fake_fp8_tensorwise_per_group_quantize(
+    tensor: torch.Tensor,
+    offs: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_scale_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, D = tensor.shape
+    num_groups = offs.numel()
+    fp8_data = torch.empty(M, D, dtype=output_dtype, device=tensor.device)
+    scales_flat = torch.empty(
+        output_scale_dim * num_groups,
+        dtype=torch.float32,
+        device=tensor.device,
+    )
+    return fp8_data, scales_flat
+
+
+@torch.library.custom_op(
+    "torchao::fp8_tensorwise_per_group_quantize_col_major", mutates_args={}
+)
+def _fp8_tensorwise_per_group_quantize_col_major(
+    tensor: torch.Tensor,
+    offs: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_scale_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Same as _fp8_tensorwise_per_group_quantize but writes FP8 output in
+    column-major layout. Eliminates the separate .copy_() transpose kernel
+    that was needed to convert row-major FP8 to col-major for _scaled_grouped_mm.
+    """
+    assert tensor.ndim == 2, "input tensor must be 2D"
+    M, D = tensor.shape
+    num_groups = offs.numel()
+
+    if _USE_JAGGED_PER_GROUP and tensor.is_contiguous():
+        fp8_data, scales = triton_fp8_per_group_tensorwise_scales_col_major(
+            tensor, offs, output_dtype, round_scales_to_power_of_2=True,
+        )
+        scales_flat = (
+            scales
+            .unsqueeze(1)
+            .expand(-1, output_scale_dim)
+            .contiguous()
+            .view(-1)
+        )
+        return fp8_data, scales_flat
+
+    # Fallback: quantize row-major then copy to col-major.
+    fp8_data_rm, scales_flat = _fp8_tensorwise_per_group_quantize(
+        tensor, offs, output_dtype, output_scale_dim,
+    )
+    fp8_data_cm = torch.empty(
+        D, M, dtype=output_dtype, device=tensor.device
+    ).t()
+    fp8_data_cm.copy_(fp8_data_rm)
+    return fp8_data_cm, scales_flat
+
+
+@_fp8_tensorwise_per_group_quantize_col_major.register_fake
+def _fake_fp8_tensorwise_per_group_quantize_col_major(
+    tensor: torch.Tensor,
+    offs: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_scale_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, D = tensor.shape
+    num_groups = offs.numel()
+    fp8_data = torch.empty(
+        D, M, dtype=output_dtype, device=tensor.device
+    ).t()
+    scales_flat = torch.empty(
+        output_scale_dim * num_groups,
+        dtype=torch.float32,
+        device=tensor.device,
+    )
+    return fp8_data, scales_flat

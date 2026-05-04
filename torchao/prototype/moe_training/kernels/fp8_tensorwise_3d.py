@@ -77,6 +77,7 @@ if torch_version_at_least("2.7.0") and has_triton():
         E: int,
         K: int,
         N: int,
+        INPUT_DTYPE_MAX: tl.constexpr,  # max finite value of the input dtype
         BLOCK_SIZE_K: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
         EPS: tl.constexpr,
@@ -99,7 +100,18 @@ if torch_version_at_least("2.7.0") and has_triton():
                 + n_offs[None, :] * stride_input_n
             )
             mask = k_mask[:, None] & n_mask[None, :]
-            vals = tl.load(input_ptr + input_offs, mask=mask, other=0.0)
+            vals = tl.load(input_ptr + input_offs, mask=mask, other=0.0).to(
+                tl.float32
+            )
+
+            # nan_to_num: NaN → 0, ±inf → ±INPUT_DTYPE_MAX (matches torch.nan_to_num).
+            # Must be applied before the abs+max so the resulting amax stays
+            # finite even in the presence of NaN/inf inputs (early-training
+            # loss spikes / LR overshoot). Pass 2 must apply the identical
+            # transformation so scaled values are consistent with the amax.
+            vals = tl.where(vals != vals, 0.0, vals)
+            vals = tl.where(vals > INPUT_DTYPE_MAX, INPUT_DTYPE_MAX, vals)
+            vals = tl.where(vals < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, vals)
 
             block_amax = tl.max(tl.abs(vals), axis=0)
             col_amax = tl.maximum(col_amax, block_amax)
@@ -135,6 +147,7 @@ if torch_version_at_least("2.7.0") and has_triton():
         fp8_dtype_max: tl.constexpr,
         output_dtype: tl.constexpr,
         ROUND_POW2: tl.constexpr,
+        INPUT_DTYPE_MAX: tl.constexpr,  # max finite value of the input dtype
         BLOCK_SIZE_K: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
         EPS: tl.constexpr,
@@ -164,9 +177,17 @@ if torch_version_at_least("2.7.0") and has_triton():
                 + n_offs[None, :] * stride_input_n
             )
             mask = k_mask[:, None] & n_mask[None, :]
-            vals = tl.load(input_ptr + input_offs, mask=mask, other=0.0)
+            vals = tl.load(input_ptr + input_offs, mask=mask, other=0.0).to(
+                tl.float32
+            )
 
-            scaled_vals = vals.to(tl.float32) * scale
+            # nan_to_num: must match pass 1 so scaled values are consistent
+            # with the amax (and so a NaN/inf input cannot poison the FP8 cast).
+            vals = tl.where(vals != vals, 0.0, vals)
+            vals = tl.where(vals > INPUT_DTYPE_MAX, INPUT_DTYPE_MAX, vals)
+            vals = tl.where(vals < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, vals)
+
+            scaled_vals = vals * scale
             clamped_vals = tl.minimum(
                 tl.maximum(scaled_vals, fp8_dtype_min), fp8_dtype_max
             ).to(output_dtype)
@@ -214,6 +235,7 @@ if torch_version_at_least("2.7.0") and has_triton():
 
         fp8_dtype_min = torch.finfo(output_dtype).min
         fp8_dtype_max = torch.finfo(output_dtype).max
+        input_dtype_max = torch.finfo(hp_tensor.dtype).max
 
         e, k, n = hp_tensor.shape
 
@@ -242,6 +264,7 @@ if torch_version_at_least("2.7.0") and has_triton():
             e,
             k,
             n,
+            INPUT_DTYPE_MAX=input_dtype_max,
             EPS=EPS,
         )
 
@@ -267,6 +290,7 @@ if torch_version_at_least("2.7.0") and has_triton():
             fp8_dtype_max,
             tl_output_dtype,
             round_scales_to_power_of_2,
+            INPUT_DTYPE_MAX=input_dtype_max,
             EPS=EPS,
         )
 

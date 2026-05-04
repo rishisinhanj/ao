@@ -904,6 +904,7 @@ if torch_version_at_least("2.7.0") and has_triton():
         stride_input_row: tl.int64,
         stride_input_col: tl.int64,
         input_dtype: tl.constexpr,
+        INPUT_DTYPE_MAX: tl.constexpr,
         N_COL_BLOCKS: tl.int64,
         BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE_ITER: tl.constexpr,
@@ -937,6 +938,9 @@ if torch_version_at_least("2.7.0") and has_triton():
             data = tl.load(
                 input_ptr + block_offs, mask=block_mask, other=0.0
             ).to(tl.float32)
+            data = tl.where(data != data, 0.0, data)
+            data = tl.where(data > INPUT_DTYPE_MAX, INPUT_DTYPE_MAX, data)
+            data = tl.where(data < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, data)
             col_amax = tl.maximum(
                 col_amax, tl.max(tl.abs(data), axis=0)
             )
@@ -970,6 +974,7 @@ if torch_version_at_least("2.7.0") and has_triton():
         fp8_dtype_max: tl.constexpr,
         input_dtype: tl.constexpr,
         output_dtype: tl.constexpr,
+        INPUT_DTYPE_MAX: tl.constexpr,
         ROUND_POW2: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE_ITER: tl.constexpr,
@@ -1010,6 +1015,9 @@ if torch_version_at_least("2.7.0") and has_triton():
             data = tl.load(
                 input_ptr + block_offs, mask=block_mask, other=0.0
             ).to(tl.float32)
+            data = tl.where(data != data, 0.0, data)
+            data = tl.where(data > INPUT_DTYPE_MAX, INPUT_DTYPE_MAX, data)
+            data = tl.where(data < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, data)
             scaled_data = data * scale
             clamped = tl.minimum(
                 tl.maximum(scaled_data, fp8_dtype_min), fp8_dtype_max
@@ -1047,6 +1055,7 @@ if torch_version_at_least("2.7.0") and has_triton():
 
         fp8_dtype_min = torch.finfo(output_dtype).min
         fp8_dtype_max = torch.finfo(output_dtype).max
+        input_dtype_max = torch.finfo(hp_tensor.dtype).max
 
         m, k = hp_tensor.shape
         n_groups = offsets.numel()
@@ -1076,7 +1085,8 @@ if torch_version_at_least("2.7.0") and has_triton():
             hp_tensor.stride(0),
             hp_tensor.stride(1),
             tl_input_dtype,
-            n_col_blocks,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            N_COL_BLOCKS=n_col_blocks,
             EPS=EPS,
         )
 
@@ -1104,7 +1114,8 @@ if torch_version_at_least("2.7.0") and has_triton():
             fp8_dtype_max,
             tl_input_dtype,
             tl_output_dtype,
-            round_scales_to_power_of_2,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            ROUND_POW2=round_scales_to_power_of_2,
             EPS=EPS,
         )
 
@@ -1151,6 +1162,7 @@ if torch_version_at_least("2.7.0") and has_triton():
 
         fp8_dtype_min = torch.finfo(output_dtype).min
         fp8_dtype_max = torch.finfo(output_dtype).max
+        input_dtype_max = torch.finfo(hp_tensor.dtype).max
 
         m, k = hp_tensor.shape
         n_groups = offsets.numel()
@@ -1181,7 +1193,8 @@ if torch_version_at_least("2.7.0") and has_triton():
             hp_tensor.stride(0),
             hp_tensor.stride(1),
             tl_input_dtype,
-            n_col_blocks,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            N_COL_BLOCKS=n_col_blocks,
             EPS=EPS,
         )
 
@@ -1209,7 +1222,8 @@ if torch_version_at_least("2.7.0") and has_triton():
             fp8_dtype_max,
             tl_input_dtype,
             tl_output_dtype,
-            round_scales_to_power_of_2,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            ROUND_POW2=round_scales_to_power_of_2,
             EPS=EPS,
         )
 
@@ -1255,6 +1269,8 @@ if torch_version_at_least("2.7.0") and has_triton():
         K: tl.int64,
         N_GROUPS: tl.int64,
         N_COL_BLOCKS: tl.int64,
+        INPUT_DTYPE_MAX_1: tl.constexpr,
+        INPUT_DTYPE_MAX_2: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE_ITER: tl.constexpr,
         EPS: tl.constexpr,
@@ -1290,6 +1306,9 @@ if torch_version_at_least("2.7.0") and has_triton():
                 )
                 mask_1 = row_mask[:, None] & (block_col_offs[None, :] < K1)
                 data_1 = tl.load(input_ptr_1 + offs_1, mask=mask_1, other=0.0).to(tl.float32)
+                data_1 = tl.where(data_1 != data_1, 0.0, data_1)
+                data_1 = tl.where(data_1 > INPUT_DTYPE_MAX_1, INPUT_DTYPE_MAX_1, data_1)
+                data_1 = tl.where(data_1 < -INPUT_DTYPE_MAX_1, -INPUT_DTYPE_MAX_1, data_1)
                 amax_1 = tl.maximum(amax_1, tl.max(tl.abs(data_1), axis=0))
 
             if process_2:
@@ -1299,6 +1318,9 @@ if torch_version_at_least("2.7.0") and has_triton():
                 )
                 mask_2 = row_mask[:, None] & (block_col_offs[None, :] < K2)
                 data_2 = tl.load(input_ptr_2 + offs_2, mask=mask_2, other=0.0).to(tl.float32)
+                data_2 = tl.where(data_2 != data_2, 0.0, data_2)
+                data_2 = tl.where(data_2 > INPUT_DTYPE_MAX_2, INPUT_DTYPE_MAX_2, data_2)
+                data_2 = tl.where(data_2 < -INPUT_DTYPE_MAX_2, -INPUT_DTYPE_MAX_2, data_2)
                 amax_2 = tl.maximum(amax_2, tl.max(tl.abs(data_2), axis=0))
 
         if process_1:
@@ -1343,6 +1365,8 @@ if torch_version_at_least("2.7.0") and has_triton():
         fp8_dtype_max: tl.constexpr,
         output_dtype: tl.constexpr,
         ROUND_POW2: tl.constexpr,
+        INPUT_DTYPE_MAX_1: tl.constexpr,
+        INPUT_DTYPE_MAX_2: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         BLOCK_SIZE_ITER: tl.constexpr,
         EPS: tl.constexpr,
@@ -1394,6 +1418,9 @@ if torch_version_at_least("2.7.0") and has_triton():
                 )
                 mask_1 = row_mask[:, None] & (block_col_offs[None, :] < K1)
                 d1 = tl.load(input_ptr_1 + in_offs_1, mask=mask_1, other=0.0).to(tl.float32)
+                d1 = tl.where(d1 != d1, 0.0, d1)
+                d1 = tl.where(d1 > INPUT_DTYPE_MAX_1, INPUT_DTYPE_MAX_1, d1)
+                d1 = tl.where(d1 < -INPUT_DTYPE_MAX_1, -INPUT_DTYPE_MAX_1, d1)
                 fp8_1 = tl.minimum(
                     tl.maximum(d1 * scale_1, fp8_dtype_min), fp8_dtype_max
                 ).to(output_dtype)
@@ -1410,6 +1437,9 @@ if torch_version_at_least("2.7.0") and has_triton():
                 )
                 mask_2 = row_mask[:, None] & (block_col_offs[None, :] < K2)
                 d2 = tl.load(input_ptr_2 + in_offs_2, mask=mask_2, other=0.0).to(tl.float32)
+                d2 = tl.where(d2 != d2, 0.0, d2)
+                d2 = tl.where(d2 > INPUT_DTYPE_MAX_2, INPUT_DTYPE_MAX_2, d2)
+                d2 = tl.where(d2 < -INPUT_DTYPE_MAX_2, -INPUT_DTYPE_MAX_2, d2)
                 fp8_2 = tl.minimum(
                     tl.maximum(d2 * scale_2, fp8_dtype_min), fp8_dtype_max
                 ).to(output_dtype)
@@ -1449,6 +1479,8 @@ if torch_version_at_least("2.7.0") and has_triton():
         tl_output_dtype = FP8_DTYPE_MAP[output_dtype]
         fp8_dtype_min = torch.finfo(output_dtype).min
         fp8_dtype_max = torch.finfo(output_dtype).max
+        input_dtype_max_1 = torch.finfo(hp_tensor_1.dtype).max
+        input_dtype_max_2 = torch.finfo(hp_tensor_2.dtype).max
 
         m = hp_tensor_1.shape[0]
         k1 = hp_tensor_1.shape[1]
@@ -1484,6 +1516,8 @@ if torch_version_at_least("2.7.0") and has_triton():
             k_max,
             n_groups,
             n_col_blocks,
+            INPUT_DTYPE_MAX_1=input_dtype_max_1,
+            INPUT_DTYPE_MAX_2=input_dtype_max_2,
             EPS=EPS,
         )
 
@@ -1522,7 +1556,9 @@ if torch_version_at_least("2.7.0") and has_triton():
             fp8_dtype_min,
             fp8_dtype_max,
             tl_output_dtype,
-            round_scales_to_power_of_2,
+            ROUND_POW2=round_scales_to_power_of_2,
+            INPUT_DTYPE_MAX_1=input_dtype_max_1,
+            INPUT_DTYPE_MAX_2=input_dtype_max_2,
             EPS=EPS,
         )
 
@@ -1579,33 +1615,6 @@ else:
             "triton_fp8_per_group_colwise_scales_dual requires torch 2.7.0+ and triton installed"
         )
 
-    def triton_fp8_per_group_tensorwise_scales(
-        hp_tensor: torch.Tensor,
-        offsets: torch.Tensor,
-        output_dtype: torch.dtype = torch.float8_e4m3fn,
-        round_scales_to_power_of_2: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError(
-            "triton_fp8_per_group_tensorwise_scales requires torch 2.7.0+ and triton installed"
-        )
-
-    def triton_fp8_per_group_tensorwise_scales_col_major(
-        hp_tensor: torch.Tensor,
-        offsets: torch.Tensor,
-        output_dtype: torch.dtype = torch.float8_e4m3fn,
-        round_scales_to_power_of_2: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError(
-            "triton_fp8_per_group_tensorwise_scales_col_major requires torch 2.7.0+ and triton installed"
-        )
-
-    def triton_fp8_per_group_tensorwise_dual_col_major(
-        hp_tensor_1: torch.Tensor,
-        hp_tensor_2: torch.Tensor,
-        offsets: torch.Tensor,
-        output_dtype: torch.dtype = torch.float8_e4m3fn,
-        round_scales_to_power_of_2: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        raise NotImplementedError(
-            "triton_fp8_per_group_tensorwise_dual_col_major requires torch 2.7.0+ and triton installed"
-        )
+    triton_fp8_per_group_tensorwise_scales = None
+    triton_fp8_per_group_tensorwise_scales_col_major = None
+    triton_fp8_per_group_tensorwise_dual_col_major = None

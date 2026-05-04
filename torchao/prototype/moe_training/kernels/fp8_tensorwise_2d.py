@@ -139,7 +139,9 @@ if torch_version_at_least("2.7.0") and has_triton():
         x = tl.where(x < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, x)
 
         # Saturate to FP8 range then cast (mirrors to_fp8_saturated).
-        x_clamped = tl.clamp(x * scale, fp8_min, fp8_max)
+        # Use min/max instead of tl.clamp because tl.clamp can produce
+        # incorrect FP8 values on AMD ROCm.
+        x_clamped = tl.minimum(tl.maximum(x * scale, fp8_min), fp8_max)
         tl.store(out_ptr + offs, x_clamped.to(OUTPUT_DTYPE), mask=mask)
 
     def triton_fp8_tensorwise_quantize_2d(

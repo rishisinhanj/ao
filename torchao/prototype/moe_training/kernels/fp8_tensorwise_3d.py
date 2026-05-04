@@ -199,6 +199,158 @@ if torch_version_at_least("2.7.0") and has_triton():
             )
             tl.store(output_ptr + output_offs, clamped_vals, mask=mask)
 
+    # ── Pass 2b: quantize with per-expert scale into transposed RHS layout ──
+    @triton.autotune(configs=_tensorwise_3d_configs, key=["K", "N"])
+    @triton.jit
+    def _fp8_tensorwise_3d_transpose_quantize_kernel(
+        input_ptr,
+        stride_input_e: tl.int64,
+        stride_input_k,
+        stride_input_n,
+        output_ptr,
+        stride_output_e: tl.int64,
+        stride_output_n,
+        stride_output_k,
+        expert_amax_ptr,  # (E,) float32
+        scales_out_ptr,   # (E,) float32 computed scales
+        E: int,
+        K: int,
+        N: int,
+        fp8_dtype_min: tl.constexpr,
+        fp8_dtype_max: tl.constexpr,
+        output_dtype: tl.constexpr,
+        ROUND_POW2: tl.constexpr,
+        INPUT_DTYPE_MAX: tl.constexpr,  # max finite value of the input dtype
+        BLOCK_SIZE_K: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EPS: tl.constexpr,
+    ):
+        expert_idx = tl.program_id(0)
+        n_block_idx = tl.program_id(1)
+
+        n_offs = n_block_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        n_mask = n_offs < N
+
+        amax = tl.load(expert_amax_ptr + expert_idx).to(tl.float32)
+        scale = fp8_dtype_max / tl.maximum(amax, EPS)
+        if ROUND_POW2:
+            scale = tl.exp2(tl.floor(tl.log2(scale)))
+
+        if n_block_idx == 0:
+            tl.store(scales_out_ptr + expert_idx, scale)
+
+        for k_start in range(0, K, BLOCK_SIZE_K):
+            k_offs = k_start + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offs < K
+
+            input_offs = (
+                expert_idx * stride_input_e
+                + k_offs[:, None] * stride_input_k
+                + n_offs[None, :] * stride_input_n
+            )
+            mask = k_mask[:, None] & n_mask[None, :]
+            vals = tl.load(input_ptr + input_offs, mask=mask, other=0.0).to(
+                tl.float32
+            )
+
+            vals = tl.where(vals != vals, 0.0, vals)
+            vals = tl.where(vals > INPUT_DTYPE_MAX, INPUT_DTYPE_MAX, vals)
+            vals = tl.where(vals < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, vals)
+
+            scaled_vals = vals * scale
+            clamped_vals = tl.minimum(
+                tl.maximum(scaled_vals, fp8_dtype_min), fp8_dtype_max
+            ).to(output_dtype)
+
+            # Input is (E, K, N); output is (E, N, K) column-major.
+            output_offs = (
+                expert_idx * stride_output_e
+                + n_offs[None, :] * stride_output_n
+                + k_offs[:, None] * stride_output_k
+            )
+            tl.store(output_ptr + output_offs, clamped_vals, mask=mask)
+
+    # ── Pass 2c: quantize and write both grouped-GEMM RHS layouts ───────────
+    @triton.autotune(configs=_tensorwise_3d_configs, key=["K", "N"])
+    @triton.jit
+    def _fp8_tensorwise_3d_dual_layout_quantize_kernel(
+        input_ptr,
+        stride_input_e: tl.int64,
+        stride_input_k,
+        stride_input_n,
+        output_fwd_ptr,
+        stride_output_fwd_e: tl.int64,
+        stride_output_fwd_k,
+        stride_output_fwd_n,
+        output_rhs_ptr,
+        stride_output_rhs_e: tl.int64,
+        stride_output_rhs_n,
+        stride_output_rhs_k,
+        expert_amax_ptr,  # (E,) float32
+        scales_out_ptr,   # (E,) float32 computed scales
+        E: int,
+        K: int,
+        N: int,
+        fp8_dtype_min: tl.constexpr,
+        fp8_dtype_max: tl.constexpr,
+        output_dtype: tl.constexpr,
+        ROUND_POW2: tl.constexpr,
+        INPUT_DTYPE_MAX: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EPS: tl.constexpr,
+    ):
+        expert_idx = tl.program_id(0)
+        n_block_idx = tl.program_id(1)
+
+        n_offs = n_block_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        n_mask = n_offs < N
+
+        amax = tl.load(expert_amax_ptr + expert_idx).to(tl.float32)
+        scale = fp8_dtype_max / tl.maximum(amax, EPS)
+        if ROUND_POW2:
+            scale = tl.exp2(tl.floor(tl.log2(scale)))
+
+        if n_block_idx == 0:
+            tl.store(scales_out_ptr + expert_idx, scale)
+
+        for k_start in range(0, K, BLOCK_SIZE_K):
+            k_offs = k_start + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offs < K
+
+            input_offs = (
+                expert_idx * stride_input_e
+                + k_offs[:, None] * stride_input_k
+                + n_offs[None, :] * stride_input_n
+            )
+            mask = k_mask[:, None] & n_mask[None, :]
+            vals = tl.load(input_ptr + input_offs, mask=mask, other=0.0).to(
+                tl.float32
+            )
+
+            vals = tl.where(vals != vals, 0.0, vals)
+            vals = tl.where(vals > INPUT_DTYPE_MAX, INPUT_DTYPE_MAX, vals)
+            vals = tl.where(vals < -INPUT_DTYPE_MAX, -INPUT_DTYPE_MAX, vals)
+
+            scaled_vals = vals * scale
+            clamped_vals = tl.minimum(
+                tl.maximum(scaled_vals, fp8_dtype_min), fp8_dtype_max
+            ).to(output_dtype)
+
+            fwd_offs = (
+                expert_idx * stride_output_fwd_e
+                + k_offs[:, None] * stride_output_fwd_k
+                + n_offs[None, :] * stride_output_fwd_n
+            )
+            tl.store(output_fwd_ptr + fwd_offs, clamped_vals, mask=mask)
+
+            rhs_offs = (
+                expert_idx * stride_output_rhs_e
+                + n_offs[None, :] * stride_output_rhs_n
+                + k_offs[:, None] * stride_output_rhs_k
+            )
+            tl.store(output_rhs_ptr + rhs_offs, clamped_vals, mask=mask)
+
     # ── Python wrapper ──────────────────────────────────────────────────────
     @torch.library.custom_op(
         "torchao::triton_fp8_tensorwise_3d_scale_and_cast", mutates_args={}
@@ -296,6 +448,170 @@ if torch_version_at_least("2.7.0") and has_triton():
 
         return output_buffer, scales
 
+    @torch.library.custom_op(
+        "torchao::triton_fp8_tensorwise_3d_transpose_rhs_scale_and_cast",
+        mutates_args={},
+    )
+    def triton_fp8_tensorwise_3d_transpose_rhs_scale_and_cast(
+        hp_tensor: torch.Tensor,
+        output_dtype: torch.dtype = torch.float8_e4m3fn,
+        round_scales_to_power_of_2: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fused per-expert tensorwise scale computation and FP8 cast for the
+        backward RHS layout. Reads (E, K, N) column-major and writes (E, N, K)
+        column-major directly, avoiding a full FP8 contiguous copy.
+        """
+        assert hp_tensor.ndim == 3, "input tensor must be 3D"
+
+        tl_output_dtype = FP8_DTYPE_MAP[output_dtype]
+
+        fp8_dtype_min = torch.finfo(output_dtype).min
+        fp8_dtype_max = torch.finfo(output_dtype).max
+        input_dtype_max = torch.finfo(hp_tensor.dtype).max
+
+        e, k, n = hp_tensor.shape
+
+        output_buffer = torch.empty(
+            (e, n, k), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, n, k), (n * k, 1, n))
+
+        min_bn = min(c.kwargs["BLOCK_SIZE_N"] for c in _tensorwise_3d_configs)
+        n_n_blocks = triton.cdiv(n, min_bn)
+        partial_amax = torch.zeros(
+            (e, n_n_blocks), dtype=torch.float32, device=hp_tensor.device
+        )
+
+        grid = lambda meta: (e, triton.cdiv(n, meta["BLOCK_SIZE_N"]))
+
+        _fp8_tensorwise_3d_amax_kernel[grid](
+            hp_tensor,
+            hp_tensor.stride(0),
+            hp_tensor.stride(1),
+            hp_tensor.stride(2),
+            partial_amax,
+            partial_amax.stride(0),
+            partial_amax.stride(1),
+            e,
+            k,
+            n,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            EPS=EPS,
+        )
+
+        expert_amax = partial_amax.max(dim=1).values
+        scales = torch.empty(e, dtype=torch.float32, device=hp_tensor.device)
+
+        _fp8_tensorwise_3d_transpose_quantize_kernel[grid](
+            hp_tensor,
+            hp_tensor.stride(0),
+            hp_tensor.stride(1),
+            hp_tensor.stride(2),
+            output_buffer,
+            output_buffer.stride(0),
+            output_buffer.stride(1),
+            output_buffer.stride(2),
+            expert_amax,
+            scales,
+            e,
+            k,
+            n,
+            fp8_dtype_min,
+            fp8_dtype_max,
+            tl_output_dtype,
+            round_scales_to_power_of_2,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            EPS=EPS,
+        )
+
+        return output_buffer, scales
+
+    @torch.library.custom_op(
+        "torchao::triton_fp8_tensorwise_3d_dual_layout_scale_and_cast",
+        mutates_args={},
+    )
+    def triton_fp8_tensorwise_3d_dual_layout_scale_and_cast(
+        hp_tensor: torch.Tensor,
+        output_dtype: torch.dtype = torch.float8_e4m3fn,
+        round_scales_to_power_of_2: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Per-expert tensorwise quantization that writes both RHS layouts from a
+        single scale computation:
+          - (E, K, N) column-major for forward
+          - (E, N, K) column-major for backward grad_A
+        """
+        assert hp_tensor.ndim == 3, "input tensor must be 3D"
+
+        tl_output_dtype = FP8_DTYPE_MAP[output_dtype]
+
+        fp8_dtype_min = torch.finfo(output_dtype).min
+        fp8_dtype_max = torch.finfo(output_dtype).max
+        input_dtype_max = torch.finfo(hp_tensor.dtype).max
+
+        e, k, n = hp_tensor.shape
+
+        fwd_buffer = torch.empty(
+            (e, k, n), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, k, n), (k * n, 1, k))
+        rhs_buffer = torch.empty(
+            (e, n, k), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, n, k), (n * k, 1, n))
+
+        min_bn = min(c.kwargs["BLOCK_SIZE_N"] for c in _tensorwise_3d_configs)
+        n_n_blocks = triton.cdiv(n, min_bn)
+        partial_amax = torch.zeros(
+            (e, n_n_blocks), dtype=torch.float32, device=hp_tensor.device
+        )
+
+        grid = lambda meta: (e, triton.cdiv(n, meta["BLOCK_SIZE_N"]))
+
+        _fp8_tensorwise_3d_amax_kernel[grid](
+            hp_tensor,
+            hp_tensor.stride(0),
+            hp_tensor.stride(1),
+            hp_tensor.stride(2),
+            partial_amax,
+            partial_amax.stride(0),
+            partial_amax.stride(1),
+            e,
+            k,
+            n,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            EPS=EPS,
+        )
+
+        expert_amax = partial_amax.max(dim=1).values
+        scales = torch.empty(e, dtype=torch.float32, device=hp_tensor.device)
+
+        _fp8_tensorwise_3d_dual_layout_quantize_kernel[grid](
+            hp_tensor,
+            hp_tensor.stride(0),
+            hp_tensor.stride(1),
+            hp_tensor.stride(2),
+            fwd_buffer,
+            fwd_buffer.stride(0),
+            fwd_buffer.stride(1),
+            fwd_buffer.stride(2),
+            rhs_buffer,
+            rhs_buffer.stride(0),
+            rhs_buffer.stride(1),
+            rhs_buffer.stride(2),
+            expert_amax,
+            scales,
+            e,
+            k,
+            n,
+            fp8_dtype_min,
+            fp8_dtype_max,
+            tl_output_dtype,
+            round_scales_to_power_of_2,
+            INPUT_DTYPE_MAX=input_dtype_max,
+            EPS=EPS,
+        )
+
+        return fwd_buffer, rhs_buffer, scales
+
     @triton_fp8_tensorwise_3d_scale_and_cast.register_fake
     def _fake_triton_fp8_tensorwise_3d_scale_and_cast(
         hp_tensor: torch.Tensor,
@@ -310,13 +626,38 @@ if torch_version_at_least("2.7.0") and has_triton():
         scales = torch.empty(e, dtype=torch.float32, device=hp_tensor.device)
         return fp8_data, scales
 
-else:
+    @triton_fp8_tensorwise_3d_dual_layout_scale_and_cast.register_fake
+    def _fake_triton_fp8_tensorwise_3d_dual_layout_scale_and_cast(
+        hp_tensor: torch.Tensor,
+        output_dtype: torch.dtype = torch.float8_e4m3fn,
+        round_scales_to_power_of_2: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert hp_tensor.ndim == 3, "input tensor must be 3D"
+        e, k, n = hp_tensor.shape
+        fwd_data = torch.empty(
+            (e, k, n), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, k, n), (k * n, 1, k))
+        rhs_data = torch.empty(
+            (e, n, k), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, n, k), (n * k, 1, n))
+        scales = torch.empty(e, dtype=torch.float32, device=hp_tensor.device)
+        return fwd_data, rhs_data, scales
 
-    def triton_fp8_tensorwise_3d_scale_and_cast(
+    @triton_fp8_tensorwise_3d_transpose_rhs_scale_and_cast.register_fake
+    def _fake_triton_fp8_tensorwise_3d_transpose_rhs_scale_and_cast(
         hp_tensor: torch.Tensor,
         output_dtype: torch.dtype = torch.float8_e4m3fn,
         round_scales_to_power_of_2: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError(
-            "triton_fp8_tensorwise_3d_scale_and_cast requires torch 2.7.0+ and triton installed"
-        )
+        assert hp_tensor.ndim == 3, "input tensor must be 3D"
+        e, k, n = hp_tensor.shape
+        fp8_data = torch.empty(
+            (e, n, k), dtype=output_dtype, device=hp_tensor.device
+        ).as_strided((e, n, k), (n * k, 1, n))
+        scales = torch.empty(e, dtype=torch.float32, device=hp_tensor.device)
+        return fp8_data, scales
+
+else:
+    triton_fp8_tensorwise_3d_scale_and_cast = None
+    triton_fp8_tensorwise_3d_transpose_rhs_scale_and_cast = None
+    triton_fp8_tensorwise_3d_dual_layout_scale_and_cast = None

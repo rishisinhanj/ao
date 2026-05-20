@@ -6,8 +6,10 @@ if not torch.cuda.is_available():
 
 from torchao.prototype.moe_training.ep.kernels import generate_permute_indices
 from torchao.prototype.moe_training.ep.permute import (
+    _DispatchGatherBF16,
     _PermuteBF16FwdBF16Bwd,
     _UnpermuteBF16,
+    dispatch_gather,
     permute_and_pad,
     unpermute_and_unpad,
 )
@@ -80,6 +82,31 @@ def test_round_trip_gradient(M, D, ne, ep):
     unpermute_and_unpad(x_perm * 2.0, shape, indices).sum().backward()
 
     assert torch.equal(x.grad, torch.full_like(x.grad, 2.0))
+
+
+@pytest.mark.parametrize("M,D,top_k", [(64, 16, 1), (64, 16, 8), (4096, 128, 8)])
+def test_dispatch_gather_backward_matches_pytorch(M, D, top_k):
+    """dispatch_gather forward and backward match plain x[indices]."""
+    torch.manual_seed(42)
+    # Each token index appears top_k times (multiple experts per token)
+    indices = torch.randint(0, M, (M * top_k,), device=DEVICE, dtype=torch.int64)
+
+    x_ref = torch.randn(M, D, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    y_ref = x_ref[indices]
+    y_ref.sum().backward()
+    grad_ref = x_ref.grad.clone()
+
+    x2 = x_ref.data.clone().requires_grad_(True)
+    y2 = _DispatchGatherBF16.apply(x2, indices)
+    y2.sum().backward()
+
+    assert torch.equal(y_ref, y2), "dispatch_gather forward mismatch"
+    # Backward uses atomic_add, so order may differ slightly from PyTorch's
+    # reference, but the result should be very close (BF16 atomics).
+    assert torch.allclose(grad_ref, x2.grad, atol=1e-2, rtol=1e-2), (
+        f"dispatch_gather backward mismatch: max diff "
+        f"{(grad_ref - x2.grad).abs().max().item()}"
+    )
 
 
 def test_zero_token_experts():

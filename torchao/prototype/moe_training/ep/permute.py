@@ -287,6 +287,138 @@ def _triton_unpermute_bwd_kernel(
     )
 
 
+class _DispatchGatherBF16(torch.autograd.Function):
+    """Gather tokens for expert dispatch with a Triton scatter-add backward.
+
+    The forward is ``routed_input = x[token_indices]``.  PyTorch's default
+    backward decomposes this into many small aten ops (remainder, mul, div,
+    arange) plus an atomic scatter (``indexing_backward_kernel``).  Our
+    backward replaces all of that with a single Triton kernel that does the
+    scatter-add directly.
+
+    Indices may contain duplicates when top_k > 1 (each token is sent to
+    top_k experts), so the backward uses atomic add for correctness.
+
+    Only 2D ``x`` is supported.  ``token_indices`` must be contiguous and
+    contain non-negative values in ``[0, x.shape[0])``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        assert x.dim() == 2, "_DispatchGatherBF16 only supports 2D x"
+        ctx.save_for_backward(token_indices)
+        ctx.x_shape = x.shape
+        return x[token_indices]
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (token_indices,) = ctx.saved_tensors
+        grad_x = _triton_dispatch_gather_bwd(
+            grad_output.contiguous(),
+            token_indices,
+            ctx.x_shape[0],
+            ctx.x_shape[1],
+        )
+        return grad_x, None
+
+
+@triton_op("torchao::_triton_dispatch_gather_bwd", mutates_args={})
+def _triton_dispatch_gather_bwd(
+    grad_output: torch.Tensor,
+    token_indices: torch.Tensor,
+    x_rows: int,
+    x_cols: int,
+) -> torch.Tensor:
+    """Scatter-add grad_output into grad_x positions using token_indices.
+
+    For the backward of ``y = x[indices]``: ``grad_x[indices[i]] += grad_y[i]``.
+    Multiple positions can map to the same x row when top_k > 1, so atomic
+    add is required.
+    """
+    grad_x = grad_output.new_zeros((x_rows, x_cols))
+    n_indices = token_indices.shape[0]
+    grid = lambda meta: (
+        triton.cdiv(n_indices, meta["BLOCK_ROWS"]),
+        triton.cdiv(x_cols, meta["BLOCK_COLS"]),
+    )
+    wrap_triton(_triton_dispatch_gather_bwd_kernel)[grid](
+        grad_output,
+        token_indices,
+        grad_x,
+        n_indices,
+        x_rows,
+        x_cols,
+        BLOCK_ROWS=256,
+        BLOCK_COLS=256,
+    )
+    return grad_x
+
+
+@triton.jit
+def _triton_dispatch_gather_bwd_kernel(
+    grad_ptr,
+    indices_ptr,
+    output_ptr,
+    n_indices,
+    x_rows,
+    x_cols,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """For each source row i in grad_output, atomic-add into output[indices[i]].
+
+    Multiple source rows may target the same destination (when top_k > 1),
+    so we use atomic add.
+    """
+    row_pid = tl.program_id(0)
+    col_pid = tl.program_id(1)
+    row_offsets = row_pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col_offsets = col_pid * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+
+    dest_rows = tl.load(
+        indices_ptr + row_offsets,
+        mask=row_offsets < n_indices,
+        other=0,
+    )
+
+    grad_mask = (row_offsets[:, None] < n_indices) & (
+        col_offsets[None, :] < x_cols
+    )
+    grad_vals = tl.load(
+        grad_ptr + row_offsets[:, None] * x_cols + col_offsets[None, :],
+        mask=grad_mask,
+        other=0.0,
+    )
+
+    write_mask = (
+        (row_offsets[:, None] < n_indices)
+        & (dest_rows[:, None] >= 0)
+        & (dest_rows[:, None] < x_rows)
+        & (col_offsets[None, :] < x_cols)
+    )
+    tl.atomic_add(
+        output_ptr + dest_rows[:, None] * x_cols + col_offsets[None, :],
+        grad_vals,
+        mask=write_mask,
+    )
+
+
+def dispatch_gather(
+    x: torch.Tensor,
+    token_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Gather tokens for expert dispatch with optimized Triton backward.
+
+    Equivalent to ``x[token_indices]`` but the backward uses a single
+    Triton scatter-add kernel instead of PyTorch's decomposed implementation.
+    """
+    return _DispatchGatherBF16.apply(x, token_indices)
+
+
 class _PermuteBF16FwdBF16Bwd(torch.autograd.Function):
     """Permute+pad for BF16 tokens with a Triton backward kernel.
 

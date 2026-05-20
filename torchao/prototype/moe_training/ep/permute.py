@@ -164,6 +164,129 @@ class _PermuteMXFP8FwdHPBwd(torch.autograd.Function):
         return grad_input, None, None, None, None, None
 
 
+class _UnpermuteBF16(torch.autograd.Function):
+    """Unpermute (scatter + sentinel-strip) with a Triton gather backward.
+
+    Forward:  ``out[permuted_indices, :] = routed_output; return out[:-1]``
+    The default backward launches ``indexing_backward_kernel`` (atomic scatter)
+    for the gather of ``grad_out[permuted_indices, :]``.  Since the indices are
+    a bijection for valid positions, we replace the backward with a non-atomic
+    Triton gather kernel that also handles the sentinel row (padding positions
+    get zero gradient without needing the extra row).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        out_rows: int,
+        out_cols: int,
+    ) -> torch.Tensor:
+        out_unpermuted = routed_output.new_empty((out_rows, out_cols))
+        out_unpermuted[permuted_indices, :] = routed_output
+        ctx.save_for_backward(permuted_indices)
+        ctx.routed_output_shape = routed_output.shape
+        return out_unpermuted[:-1]
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (permuted_indices,) = ctx.saved_tensors
+        grad_routed = _triton_unpermute_bwd(
+            grad_output.contiguous(),
+            permuted_indices,
+            ctx.routed_output_shape[0],
+            ctx.routed_output_shape[1],
+        )
+        return grad_routed, None, None, None
+
+
+@triton_op("torchao::_triton_unpermute_bwd", mutates_args={})
+def _triton_unpermute_bwd(
+    grad_output: torch.Tensor,
+    permuted_indices: torch.Tensor,
+    output_rows: int,
+    output_cols: int,
+) -> torch.Tensor:
+    """Gather grad_output at permuted_indices positions.
+
+    For padding positions (permuted_indices == -1), writes zeros.
+    This replaces the default IndexPutBackward0 gather which goes through
+    indexing_backward_kernel with unnecessary atomic operations.
+    """
+    out = grad_output.new_zeros((output_rows, output_cols))
+    grad_rows = grad_output.shape[0]
+    grad_cols = grad_output.shape[1]
+    grid = lambda meta: (
+        triton.cdiv(output_rows, meta["BLOCK_ROWS"]),
+        triton.cdiv(output_cols, meta["BLOCK_COLS"]),
+    )
+    wrap_triton(_triton_unpermute_bwd_kernel)[grid](
+        grad_output,
+        permuted_indices,
+        out,
+        output_rows,
+        output_cols,
+        grad_rows,
+        grad_cols,
+        BLOCK_ROWS=256,
+        BLOCK_COLS=256,
+        PADDING_VALUE=-1,
+    )
+    return out
+
+
+@triton.jit
+def _triton_unpermute_bwd_kernel(
+    grad_ptr,
+    permuted_indices_ptr,
+    output_ptr,
+    output_rows,
+    output_cols,
+    grad_rows,
+    grad_cols,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    PADDING_VALUE: tl.constexpr = -1,
+):
+    """Gather: output[i, :] = grad[permuted_indices[i], :] for valid indices.
+
+    Each program handles a BLOCK_ROWS x BLOCK_COLS tile of the output.
+    For output row i, the source row is permuted_indices[i].  Padding
+    positions (source == PADDING_VALUE) produce zeros.
+    """
+    row_pid = tl.program_id(0)
+    col_pid = tl.program_id(1)
+    row_offsets = row_pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col_offsets = col_pid * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+
+    src_rows = tl.load(
+        permuted_indices_ptr + row_offsets,
+        mask=row_offsets < output_rows,
+        other=PADDING_VALUE,
+    )
+
+    read_mask = (
+        (src_rows[:, None] != PADDING_VALUE)
+        & (src_rows[:, None] < grad_rows)
+        & (col_offsets[None, :] < grad_cols)
+    )
+    grad_values = tl.load(
+        grad_ptr + src_rows[:, None] * grad_cols + col_offsets[None, :],
+        mask=read_mask,
+        other=0.0,
+    )
+
+    write_mask = (row_offsets[:, None] < output_rows) & (
+        col_offsets[None, :] < output_cols
+    )
+    tl.store(
+        output_ptr + row_offsets[:, None] * output_cols + col_offsets[None, :],
+        grad_values,
+        mask=write_mask,
+    )
+
+
 class _PermuteBF16FwdBF16Bwd(torch.autograd.Function):
     """Permute+pad for BF16 tokens with a Triton backward kernel.
 
@@ -240,6 +363,27 @@ def permute_and_pad(
     input_shape = (x.shape[0] + 1, x.shape[1])
 
     return input_shape, x_permuted, permuted_indices, num_tokens_per_expert_padded, group_offsets
+
+
+def unpermute_and_unpad(
+    routed_output: torch.Tensor,
+    input_shape: tuple[int, int],
+    permuted_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Reverse of ``permute_and_pad``: scatter expert outputs back and strip
+    the sentinel row, using a custom Triton gather backward.
+
+    Args:
+        routed_output: (padded_total, dim) expert outputs in expert-major padded order
+        input_shape: (N+1, dim) shape that includes the sentinel row (from permute_and_pad)
+        permuted_indices: int32 index tensor from permute_and_pad (-1 for padding)
+
+    Returns:
+        (N, dim) tensor with tokens in rank-major order (sentinel stripped)
+    """
+    return _UnpermuteBF16.apply(
+        routed_output, permuted_indices, input_shape[0], input_shape[1]
+    )
 
 
 @conditional_nostrict_trace
